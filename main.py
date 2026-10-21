@@ -5,10 +5,50 @@ import re
 import time
 from typing import Dict, Any, Optional, List
 from pathlib import Path
-from astrbot.api.event import filter, AstrMessageEvent
+from astrbot.api.event import filter, AstrMessageEvent, MessageChain
+from astrbot.api.message_components import Plain
 from astrbot.api.star import Context, Star, register
 from astrbot.api.provider import LLMResponse, ProviderRequest 
 from astrbot.api import AstrBotConfig 
+
+class StreamingCleaner:
+    HOLD_BACK = 32
+    MAX_TAG_LENGTH = 64
+    CLOSERS = {"[": "]", "【": "】"}
+
+    def __init__(self, patterns):
+        self.patterns = [re.compile(pattern) for pattern in patterns]
+        self.buffer = ""
+
+    def feed(self, text: str) -> str:
+        self.buffer += text
+        if len(self.buffer) <= self.HOLD_BACK:
+            return ""
+
+        cut = len(self.buffer) - self.HOLD_BACK
+        opener_index = max(self.buffer.rfind("["), self.buffer.rfind("【"))
+        if opener_index >= 0:
+            closer = self.CLOSERS[self.buffer[opener_index]]
+            closer_index = self.buffer.find(closer, opener_index + 1)
+            if closer_index < 0:
+                if len(self.buffer) - opener_index <= self.MAX_TAG_LENGTH:
+                    cut = min(cut, opener_index)
+            elif closer_index >= cut:
+                cut = min(cut, opener_index)
+
+        safe = self.buffer[:cut]
+        self.buffer = self.buffer[cut:]
+        return self._clean(safe)
+
+    def flush(self) -> str:
+        text = self._clean(self.buffer)
+        self.buffer = ""
+        return text
+
+    def _clean(self, text: str) -> str:
+        for pattern in self.patterns:
+            text = pattern.sub("", text)
+        return text
 
 class FavorManager:
     """好感度管理系统"""
@@ -341,7 +381,7 @@ class FavorManager:
                     self._save_data(self.session_low_counter, "session_low_counter.json")
                     self._save_data(self.last_decrease_time, "last_decrease_time.json")
 
-@register("FavorSystem", "wuyan1003", "好感度管理", "1.2.0")
+@register("FavorSystem", "wuyan1003", "好感度管理", "1.3.0", "https://github.com/SunflowerYuuka/likability-level")
 class FavorPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -369,6 +409,68 @@ class FavorPlugin(Star):
         favor_value = self.manager.get_favor(user_id, session_id)
         relationship_desc = self.manager.get_favor_level(favor_value)
         req.system_prompt += f"{relationship_desc}"
+
+    @filter.on_llm_request()
+    async def install_streaming_filter(self, event: AstrMessageEvent, req: ProviderRequest):
+        if not self.clean_response or event.get_extra("_favor_streaming_filter_installed"):
+            return
+
+        event.set_extra("_favor_streaming_filter_installed", True)
+        original_send_streaming = event.send_streaming
+
+        async def send_streaming_with_filter(generator, use_fallback=False):
+            async def filtered_generator():
+                cleaner = StreamingCleaner(self.manager.clean_patterns)
+                async for chain in generator:
+                    filtered_chain = self._filter_streaming_chain(chain, cleaner)
+                    if filtered_chain is not None:
+                        yield filtered_chain
+                tail = cleaner.flush()
+                if tail:
+                    yield MessageChain().message(tail)
+
+            await original_send_streaming(filtered_generator(), use_fallback)
+
+        event.send_streaming = send_streaming_with_filter
+
+    def _filter_streaming_chain(self, chain, cleaner: StreamingCleaner):
+        if not isinstance(chain, MessageChain) or chain.type in (
+            "reasoning",
+            "tool_call",
+            "break",
+            "agent_stats",
+            "audio_chunk",
+        ):
+            return chain
+
+        components = []
+        changed = False
+        for component in chain.chain:
+            if not isinstance(component, Plain):
+                components.append(component)
+                continue
+
+            original = component.text or ""
+            cleaned = cleaner.feed(original)
+            if cleaned == original:
+                components.append(component)
+            else:
+                changed = True
+                if cleaned:
+                    components.append(Plain(cleaned))
+
+        if not changed:
+            return chain
+        if not components:
+            return None
+        if hasattr(chain, "derive"):
+            return chain.derive(components)
+
+        filtered_chain = MessageChain(chain=components, type=chain.type)
+        filtered_chain.use_t2i_ = getattr(chain, "use_t2i_", None)
+        if hasattr(chain, "use_markdown_"):
+            filtered_chain.use_markdown_ = chain.use_markdown_
+        return filtered_chain
 
     @filter.on_llm_response()
     async def on_llm_resp(self, event: AstrMessageEvent, resp: LLMResponse):
