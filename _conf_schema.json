@@ -2,8 +2,8 @@
     "admins_id": {
         "description": "管理员QQ号列表",
         "type": "list",
-        "default": ["114514"],
-        "hint": "支持多个管理员，使用逗号分隔或列表格式"
+        "default": [],
+        "hint": "留空时回退使用 AstrBot 全局管理员（配置中的 admins_id）"
     },
     "black_threshold": {
         "description": "拉黑触发次数",
@@ -32,7 +32,7 @@
     "clean_response": {
         "description": "是否清理回复中的表情标记和好感度标签",
         "type": "bool",
-        "default": false,
+        "default": true,
         "hint": "开启后会删除符合正则表达的内容"
     },
     "clean_patterns": {
